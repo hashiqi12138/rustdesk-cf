@@ -1,0 +1,25 @@
+name = "rustdesk-cf-rdserver"
+main = "rdserver/index.js"
+compatibility_date = "2026-11-01"
+
+# Free 版不支持 cpu_ms 上限（那是 Paid 功能）；休眠 WS 按 message 计费，
+# 我们的 protobuf 解析是微秒级，免费版 10ms/invocation 足够。
+
+[[durable_objects.bindings]]
+name = "RD_HUB"
+class_name = "RdHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RdHub"]
+
+[vars]
+# 告诉客户端的中继地址。RustDesk 会连 ws://<relay-server>/ws/relay（域名）
+# 或 ws://<ip>:21119（IP 形式，端口 = rendezvous 端口 + 1）。
+# 生产：自定义域名（api-server 配 https → 客户端自动用 wss://域名/ws/relay）
+RELAY_SERVER = "rd.hashiqi12138.ccwu.cc"
+# 健康检查令牌（可选）
+HEALTH_TOKEN = ""
+
+[observability]
+enabled = true

@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Wrangler
+.wrangler/
+.dev.vars
+.env
+.env.*
+
+# RustDesk server keys — NEVER commit these
+server-data/
+*.pub
+id_ed25519
+id_ed25519.pub
+
+# Logs
+*.log
+*.err
+logs/
+
+# Build output
+dist/
+dist-rd/
+deploy/b64chunks/
+deploy/modules-b64.json
+
+# Large binaries
+*.exe
+*.zip
+*.tar.gz
+rustdesk.exe
+
+# Test artifacts
+*.json.tmp
+rd-*.json
+*-layout.json
+*-shot.png
+*-menu.json
+*-edit.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp

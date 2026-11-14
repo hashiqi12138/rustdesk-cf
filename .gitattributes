@@ -1,0 +1,20 @@
+# 统一换行符，避免 Windows/Linux 差异
+* text=auto
+
+# Shell / 脚本
+*.sh text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# 配置
+*.toml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# 二进制
+*.exe binary
+*.png binary
+*.jpg binary
+*.zip binary
