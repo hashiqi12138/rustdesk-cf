@@ -258,11 +258,14 @@ docs/                          详细文档
 |---|---|
 | `中继服务器不可达` | ① `relay-server` 不是完整 ws URL ② 端口不是 8080 ③ CF 没代理该端口 |
 | `server returned an invalid connection response` | `check_relay_request` 拒绝：两端 `relay-server` 字符串不一致 |
+| **控端日志三次 `request relay attempt` 后 `Timeout`，受控端日志完全空白** | **`relay_server` 端口不一致**。控端从 `PunchHoleResponse` 拿到的是裸域名（端口解析成 21117），受控端本地配的是 `ws://域名:8080/ws/relay`（端口 8080），`check_relay_request` 比对不等直接 bail，**不回 RelayResponse**，控端等 ACK 超时。解法：DO 的 `relayServerUrl()` 统一下发完整 URL，并在转发 `RequestRelay` 时重写 field 4（见实现要点第 9 条） |
 | `os error 10054` / `Connection reset` | ISP 阻断 CF TLS。改用明文 8080 |
 | 主机卡片显示「未知」 | ID 服务器未连通，或目标设备不在线 |
 | 日志刷 `Heartbeat failed ... :21114/api/heartbeat` | 配了 `api-server` 但 Worker 不实现 REST API。删掉该配置项 |
 | 连上但画面不显示 | 检查两端是否都在 DO `/debug` 里 online |
 | 每 20 多秒断线重连 | DO 心跳失效（本项目已内置 10s 空帧心跳，若改代码别删） |
+| **改了代码但行为没变** | **DO 实例跑旧代码**。必须提升 `hub.js` 的 `BUILD` 常量（见实现要点第 6 条） |
+| 受控端日志长期只有一行 `Preload peers done` | 可能连的是 SYSTEM 服务进程，日志在 `C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\log`，与用户 GUI 的日志目录不同 |
 
 ### 调试端点
 
@@ -294,6 +297,111 @@ curl http://rd.example.com:8080/debug
 
 5. **CF 免费版不支持 `[limits] cpu_ms`**
    部署时不要加这个配置项。
+
+6. **改代码后必须提升 `BUILD` 常量（最容易踩的坑）**
+
+   CF 的 Durable Object 实例是**长期存活**的。部署新 Worker 代码后，已存在的 DO 实例（尤其持有 WebSocket 长连接时）**仍继续运行旧代码**。
+
+   表现：`/healthz` 显示新 build，但 DO 行为还是旧的，你怎么改都没效果。
+
+   解法（本项目已内置）：`hub.js` 里定义 `export const BUILD`，`index.js` 用它拼出 DO 名字：
+
+   ```js
+   const id = env.RD_HUB.idFromName(`global-${BUILD}`);
+   ```
+
+   所以**改任何逻辑后，必须提升 `BUILD`**：
+
+   ```js
+   // rdserver/hub.js
+   export const BUILD = 'v3.7-buildsync';   // ← 改成 v3.8-xxx
+   ```
+
+   改完即自动创建全新 DO 实例，新代码立刻生效。副作用是旧实例的 peer 表和连接失效，客户端会自动重连重新注册（约 20 秒）。
+
+   **验证一行命令**：
+   ```powershell
+   $h = curl.exe -s "http://rd.example.com:8080/healthz" | ConvertFrom-Json
+   $d = curl.exe -s "http://rd.example.com:8080/debug" | ConvertFrom-Json
+   "worker=$($h.build) do=$($d.doBuild) 一致=$($h.build -eq $d.doBuild)"
+   ```
+
+7. **`send()` 必须能报错，不能静默吞掉**
+
+   原始实现是 `try { ws.send(b) } catch {}`，导致向已死连接发消息时**完全无感知**，表现为「日志说转发了但对方从没收到」。
+
+   现在 `send()` 返回布尔值，关键路径（`onRequestRelay`）发送失败会清理死连接：
+
+   ```js
+   const rs = targetWs.readyState;
+   let sendOk = false;
+   try { targetWs.send(frame); sendOk = true; } catch {}
+   if (!sendOk || rs !== 1) {
+     // 清掉死连接，否则下次还会选中它
+     this.slots.delete(targetWs);
+     return;
+   }
+   ```
+
+8. **孤儿信令腿要定期清理**
+
+   客户端每次重连都会新建一条 WS。旧的若没走 `webSocketClose` 回调就会残留（`id` 为空），累积后拖慢 `findWsById` 遍历。
+
+   `alarm()` 里每 10 秒调用 `pruneOrphanSlots()`：signal 类型 + 无 id + 存活超过 60 秒 → 主动断开并清理。
+
+9. **`RequestRelay` 转发时必须重写 `relay_server`（field 4）**
+
+   这是本项目最隐蔽的坑。完整因果链：
+
+   ```
+   控端发 PunchHoleRequest
+     → DO 回 PunchHoleResponse{relay_server: X}
+     → 控端把 X 原样塞进 RequestRelay.relay_server
+     → DO 转发给受控端
+     → 受控端 check_relay_request 比对端口：
+         check_port(X, RELAY_PORT)              ← 若 X 是裸域名 → 21117
+           vs
+         check_port(本地 relay-server, RELAY_PORT) ← 若是完整 URL → 8080
+     → 不相等 → bail("relay server was not offered by this peer")
+     → 受控端不回 RelayResponse
+     → 控端三次 request relay attempt 全超时
+   ```
+
+   注意受控端是**静默拒绝**：日志里可能只有一行 WARN，甚至完全空白，看起来像「DO 没转发」。实际上 DO 转发了，只是被对端丢掉了。
+
+   解法有两层，缺一不可：
+
+   **① 下发的值统一成完整 URL**（`relayServerUrl()`）：
+
+   ```js
+   relayServerUrl() {
+     const raw = (this.env.RELAY_SERVER || '').trim();
+     if (!raw) return '';
+     if (raw.startsWith('ws://') || raw.startsWith('wss://')) return raw;
+     let host = raw, port = '8080';
+     const m = /^([^:]+):(\d+)$/.exec(raw);
+     if (m) { host = m[1]; port = m[2]; }
+     return `ws://${host}:${port}/ws/relay`;
+   }
+   ```
+
+   **② 转发时重写 field 4**，不能透传控端的值：
+
+   ```js
+   // 逐字段重建 inner，跳过原 field 4，写入统一值，再追加 field 3(socket_addr)
+   const relayUrl = this.relayServerUrl();
+   const rebuilt = [];
+   walk(inner, (f, w, v, raw) => {
+     if (f === 4 && w === 2) return;              // 丢弃旧的 relay_server
+     if (w === 2 && raw) rebuilt.push(...tag(f, 2), ...varint(raw.length), ...raw);
+     else if (w === 0) rebuilt.push(...tag(f, 0), ...varint(v));
+   });
+   if (relayUrl) rebuilt.push(...strField(4, relayUrl));
+   const mangled = encodeAddrKey(slot.ip);
+   rebuilt.push(...tag(3, 2), ...varint(mangled.length), ...mangled);
+   ```
+
+   **根本前提**：所有客户端的 `relay-server` 配置必须与 DO 下发的值**字面完全一致**。
 
 ---
 

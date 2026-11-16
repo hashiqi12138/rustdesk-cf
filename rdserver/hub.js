@@ -75,6 +75,7 @@ import {
   walk,
   tag,
   varint,
+  strField,
   UNION_FIELD,
   RK_OK,
   RK_INVALID_ID_FORMAT,
@@ -82,6 +83,21 @@ import {
   PH_OFFLINE,
   NAT_SYMMETRIC,
 } from './protobuf.js';
+
+/**
+ * 服务端版本号（单一真源）。
+ * ---------------------------------------------------------------------------
+ * 改动 hub.js / protobuf.js 里任何逻辑后，**必须提升这个版本号**。
+ *
+ * 原因：CF 的 Durable Object 实例是长期存活的。部署新 Worker 代码后，
+ * 已存在的 DO 实例（尤其持有 WebSocket 长连接时）仍继续运行旧代码，
+ * 表现为「/healthz 显示新 build，但 DO 行为还是旧的」。
+ *
+ * index.js 会把它拼进 idFromName(`global-${BUILD}`)，所以改版本号即自动
+ * 创建全新 DO 实例，新代码立刻生效，不需要手工改名字。
+ * /debug 也输出它，便于确认 DO 里实际执行的是哪一版。
+ */
+export const BUILD = 'v3.7-buildsync';
 
 const MAX_ID_LEN = 100;
 const MIN_ID_LEN = 6;
@@ -162,7 +178,7 @@ export class RdHub {
 
     this.state.acceptWebSocket(server);
 
-    const slot = { kind, ip, src, id: null, uuid: null, peer: null, paired: false, ws: server };
+    const slot = { kind, ip, src, id: null, uuid: null, peer: null, paired: false, ws: server, bornAt: Date.now() };
     this.slots.set(server, slot);
     try { server.serializeAttachment({ kind, ip, src }); } catch {}
 
@@ -213,6 +229,9 @@ export class RdHub {
    * 中继腿是裸字节流，绝不注入（心跳只发 signal kind）。
    */
   async alarm() {
+    // 先清理孤儿信令腿（每次重连残留的空 id 连接），防止无限累积
+    this.pruneOrphanSlots();
+
     let sent = 0;
     for (const [, slot] of this.slots) {
       if (slot.kind !== 'signal') continue;
@@ -355,7 +374,11 @@ export class RdHub {
 
     // 在线判定 = 存在活跃信令腿（见头部注释第 5 条，不能用 lastReg 过期）
     const socketAddr = encodeAddrKey(slot.ip);
-    const relay = this.env.RELAY_SERVER || '';
+    // relay_server 必须与受控端 relay-server 配置**字面完全一致**。
+    // 客户端 check_relay_request 会比对端口：裸域名解析成 21117，
+    // 而 CF 只代理 8080，两端不一致会被静默拒绝（不回 RelayResponse）。
+    // 所以这里下发完整 ws URL，与客户端配置对齐。
+    const relay = this.relayServerUrl();
 
     // 只回控端「走中继」。不给被控端发 PunchHole ——
     // 被控端收到 PunchHole 会走 create_relay(initiate=true) 自造新 uuid，
@@ -364,6 +387,25 @@ export class RdHub {
     // 我们原样转发给被控端，被控端沿用 uuid_A 去中继挂腿。
     send(ws, punchHoleResponse({ socketAddr, relayServer: relay, natType: NAT_SYMMETRIC }));
     console.log(`[punch] ${req.id} online -> PunchHoleResponse(relay=${relay}) to ${who}`);
+  }
+
+  /**
+   * 计算下发给客户端的 relay_server 字符串。
+   * RELAY_SERVER 环境变量可配成域名或完整 URL：
+   *   "rd.example.com"                    → "ws://rd.example.com:8080/ws/relay"
+   *   "ws://rd.example.com:8080/ws/relay" → 原样使用
+   * 统一成完整 URL 形式，避免两端端口解析不一致导致中继被拒。
+   */
+  relayServerUrl() {
+    const raw = (this.env.RELAY_SERVER || '').trim();
+    if (!raw) return '';
+    if (raw.startsWith('ws://') || raw.startsWith('wss://')) return raw;
+    // 裸域名（可能带端口）→ 补成完整 URL
+    let host = raw;
+    let port = '8080';
+    const m = /^([^:]+):(\d+)$/.exec(raw);
+    if (m) { host = m[1]; port = m[2]; }
+    return `ws://${host}:${port}/ws/relay`;
   }
 
   async onPunchHoleSent(ws, inner) {
@@ -394,22 +436,67 @@ export class RdHub {
     // hbbs 权威语义（rendezvous_server.rs L582-628）：转发 RequestRelay 时注入
     // socket_addr = AddrMangle::encode(主控地址)（L596）。被控端的 RelayResponse
     // 会原样回显该字段（mediator create_relay L723/L775，initiate=false 时
-    // uuid/id/relay_server 全空）—— 这就是 ACK 的回程路由凭据，v3 缺这步。
-    // 逐字节保留 inner 全部原始字段（token/switch_code/control_permissions 等），
-    // 只在尾部追加 field 3，避免重建丢字段。
-    const mangled = encodeAddrKey(slot.ip);
-    const addrField = new Uint8Array([...tag(3, 2), ...varint(mangled.length), ...mangled]);
-    const merged = new Uint8Array(inner.length + addrField.length);
-    merged.set(inner, 0);
-    merged.set(addrField, inner.length);
+    // uuid/id/relay_server 全空）—— 这就是 ACK 的回程路由凭据。
+    //
+    // 同时必须重写 relay_server（field 4）：控端是从 PunchHoleResponse 里拿到
+    // relay_server 再塞进 RequestRelay 的。若 DO 下发的值和被控端本地
+    // relay-server 配置不一致，被控端 check_relay_request 会比对端口
+    // （裸域名→21117 vs 完整 URL→8080）不等，直接 bail 且不回 ACK，
+    // 表现为控端三次 request relay attempt 全超时。
+    // 做法：逐字段重建 inner，跳过原 field 4，写入本 DO 计算出的统一值；
+    // 其余字段（id/uuid/socket_addr/secure/licence_key/conn_type/未知字段）原样保留。
+    const relayUrl = this.relayServerUrl();
+    const rebuilt = [];
+    let sawRelay = false;
+    walk(inner, (f, w, v, raw) => {
+      if (f === 4 && w === 2) { sawRelay = true; return; }   // 丢弃旧的 relay_server
+      if (w === 2 && raw) {
+        rebuilt.push(...tag(f, 2), ...varint(raw.length), ...raw);
+      } else if (w === 0) {
+        rebuilt.push(...tag(f, 0), ...varint(v));
+      }
+    });
+    if (relayUrl) rebuilt.push(...strField(4, relayUrl));
+    if (!sawRelay) {
+      // 原来没有 field 4，补一个（正常情况都有，这里是防御）
+    }
 
-    send(targetWs, wrapUnion('RequestRelay', merged));
+    const mangled = encodeAddrKey(slot.ip);
+    rebuilt.push(...tag(3, 2), ...varint(mangled.length), ...mangled);
+
+    const merged = new Uint8Array(rebuilt);
+
+    // 诊断：转发前确认目标 ws 的状态。readyState 非 1 说明连接已死但 DO 还留着它。
+    // CF DO 休眠恢复后 getWebSockets() 返回的 ws 可能已失效（对端断开但 DO 不知道），
+    // send() 会抛异常或静默失败。必须检测并清掉，否则请求会一直发进黑洞。
+    const rs = targetWs.readyState;
+    let sendOk = false;
+    let sendErr = null;
+    try {
+      targetWs.send(wrapUnion('RequestRelay', merged));
+      sendOk = true;
+    } catch (e) {
+      sendErr = e && e.message ? e.message : String(e);
+    }
+
+    if (!sendOk || (typeof rs === 'number' && rs !== 1)) {
+      console.log(
+        `[RequestRelay] FAILED to ${req.id} readyState=${rs} err=${sendErr || 'none'} — dropping dead leg`
+      );
+      // 死连接必须清掉，否则下次还会选中它
+      const deadSlot = this.slots.get(targetWs);
+      if (deadSlot) {
+        try { targetWs.close(1011, 'send failed'); } catch {}
+        this.slots.delete(targetWs);
+      }
+      return;
+    }
 
     const key = bytesToHex(mangled);
     this.ackWaiters.set(key, { ws, id: slot.id || null, ts: Date.now() });
     this.pruneAckWaiters();
     console.log(
-      `[RequestRelay] forwarded to ${req.id} (verbatim + socket_addr, ack waiter=${key.slice(0, 16)}…)`
+      `[RequestRelay] forwarded to ${req.id} readyState=${rs} (ack waiter=${key.slice(0, 16)}…)`
     );
   }
 
@@ -459,10 +546,34 @@ export class RdHub {
 
   /** 按注册 ID 找活跃信令腿 */
   findWsById(id) {
+    if (!id) return null;
     for (const [, s] of this.slots) {
       if (s.kind === 'signal' && s.id === id) return s.ws;
     }
     return null;
+  }
+
+  /**
+   * 清理孤儿信令腿：注册前就断开、或 RegisterPk 失败留下的空 id 连接。
+   * 客户端每次重连都会新建一条 WS，旧的那条如果没走 close 回调就会残留，
+   * 累积后拖慢 findWsById 遍历，也会占 DO 内存。
+   * 判定：signal 类型 + 没有 id + 超过 GRACE_MS 没活动。
+   */
+  pruneOrphanSlots() {
+    const now = Date.now();
+    const GRACE_MS = 60_000;   // 给 RegisterPk 留 60s 宽限
+    let n = 0;
+    for (const [ws, s] of this.slots) {
+      if (s.kind !== 'signal') continue;
+      if (s.id) continue;
+      const born = s.bornAt || 0;
+      if (born && now - born < GRACE_MS) continue;
+      try { ws.close(1000, 'orphan signal leg'); } catch {}
+      this.slots.delete(ws);
+      n++;
+    }
+    if (n) console.log(`[prune] dropped ${n} orphan signal leg(s)`);
+    return n;
   }
 
   // ==================== 中继 ====================
@@ -596,6 +707,9 @@ export class RdHub {
   // ==================== 工具 ====================
 
   async debug() {
+    // DO 代码版本探针：DO 实例长期存活，Worker 更新后 DO 可能仍跑旧代码。
+    // 这个字段能确认 DO 里实际执行的是哪一版；应与 /healthz 的 build 一致。
+    const doBuild = BUILD;
     const stored = await this.state.storage.list({ prefix: 'peer:' });
     const peers = [];
     for (const [, v] of stored) {
@@ -619,6 +733,9 @@ export class RdHub {
       };
     });
     return {
+      doBuild,
+      relayServerRaw: this.env.RELAY_SERVER || '',
+      relayServerComputed: this.relayServerUrl(),
       peers,
       slots,
       relayPairs: pairs / 2,
@@ -634,9 +751,19 @@ function json(obj) {
   });
 }
 
+/**
+ * 发送并返回是否成功。
+ * 之前的实现 catch{} 完全吞错，导致向已死连接发消息时静默失败，
+ * 表现为「DO 说转发了但对方从没收到」。现在返回布尔值，调用方可决定是否清理。
+ */
 function send(ws, bytes) {
-  if (!ws || !bytes) return;
-  try { ws.send(bytes); } catch {}
+  if (!ws || !bytes) return false;
+  try {
+    ws.send(bytes);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

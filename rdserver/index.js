@@ -26,8 +26,22 @@
  *   因此本服务端同时接受 /ws/id 和根路径，两种配置都能用。
  */
 
-export { RdHub } from './hub.js';
+export { RdHub, BUILD } from './hub.js';
 
+import { BUILD } from './hub.js';
+
+/**
+ * 服务端版本号（定义在 hub.js，此处 import 复用，保证单一真源）。
+ * ---------------------------------------------------------------------------
+ * 用途一：/healthz 与 DO 的 /debug 都输出它，用来确认生产跑的是哪一版代码。
+ * 用途二：作为 DO 实例名的后缀。**这是关键**——CF 的 DO 实例是长期存活的，
+ *         部署新代码后，已存在的实例（尤其持有 WebSocket 长连接时）仍跑旧代码。
+ *         把版本号拼进 idFromName，改版本号即自动创建全新 DO 实例，新代码立刻生效，
+ *         不需要手工改名字。
+ *
+ * 改 hub.js / protobuf.js 里任何逻辑时，**必须同步提升 hub.js 里的 BUILD**，
+ * 否则新代码不会生效（这是本项目最容易踩的坑）。
+ */
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -37,6 +51,8 @@ export default {
       return json({
         ok: true,
         service: 'rustdesk-cf-rdserver',
+        build: BUILD,
+        doName: `global-${BUILD}`,
         routes: ['/ws/id', '/ws/relay', '/ (alias of /ws/id)', '/debug'],
         ts: new Date().toISOString(),
       });
@@ -56,7 +72,9 @@ export default {
           return new Response('Expected 101 Switching Protocols', { status: 426 });
         }
       }
-      const id = env.RD_HUB.idFromName('global');
+      // DO 实例名带版本号：改 BUILD 即自动切换新实例，新代码立刻生效。
+      // 不这样做的话，已存在的 DO 实例（尤其持有 WS 长连接时）会一直跑旧代码。
+      const id = env.RD_HUB.idFromName(`global-${BUILD}`);
       const stub = env.RD_HUB.get(id);
       return stub.fetch(request);
     }
